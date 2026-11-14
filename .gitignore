@@ -1,0 +1,21 @@
+# IDE settings
+.idea/
+
+# Virtual environment
+.venv/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# macOS
+.DS_Store
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Local environment variables
+.env
+.env.*
+!.env.example
