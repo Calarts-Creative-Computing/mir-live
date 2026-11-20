@@ -1,4 +1,11 @@
-"""Stream audio and extract RMS. Defaults to the system's input device."""
+#Stream audio and extract features
+#Defaults to the system's input device.
+"""
+Current features implemented:
+RMS
+Mel Spectrogram
+20Nov2026
+"""
 
 import argparse
 from contextlib import ExitStack
@@ -8,6 +15,7 @@ import sys
 import sounddevice as sd
 from .audio_input import FileInput, MicrophoneInput
 from .feature.rms import RMSExtractor
+from .feature.mel_spectrogram import MelExtractor
 
 _printing_enabled = True
 
@@ -71,6 +79,9 @@ def main() -> int:
     # Check for incompatible settings before opening audio devices.
     if args.hop_length > args.frame_length:
         parser.error("--hop-length must not exceed --frame-length")
+    #check for frame length
+    if args.frame_length & (args.frame_length - 1):
+        parser.error("--frame-length must be power of 2 for melspec")
     if args.quiet:
         set_terminal_printing(False)
     if args.file and (args.device is not None or args.sample_rate is not None or args.channels != 1):
@@ -118,6 +129,10 @@ def main() -> int:
 
             # Create the extractor once so it retains overlap between input blocks.
             rms_extractor = RMSExtractor(args.frame_length, args.hop_length)
+
+            #create mel_extractor only as a placeholder since it needs sample rate, after first block
+            mel_extractor = None
+
             next_frame_start = 0
             next_report_seconds = 0.0
             playback = None
@@ -127,6 +142,9 @@ def main() -> int:
             resources.callback(blocks.close)
 
             for block in blocks:
+                #create mel_extractor now since can get sample rate from the block
+                if mel_extractor is None:
+                    mel_extractor = MelExtractor(block.sample_rate, args.frame_length, args.hop_length)
                 # File playback only: write the same mono samples that RMS analyzes.
                 # Blocking output writes supply the clock, so FileInput does not sleep.
                 # Microphone input is never routed to the speakers.
@@ -146,6 +164,7 @@ def main() -> int:
                 discontinuities += int(block.discontinuity)
                 if block.discontinuity:
                     rms_extractor.reset()
+                    mel_extractor.reset()
                     next_frame_start = block.start_sample
                     if rms_plot is not None:
                         rms_plot.update([block.time_seconds], [float("nan")], block.time_seconds)
@@ -153,8 +172,10 @@ def main() -> int:
 
                 # Extract RMS for every new complete frame, keeping any overlap.
                 rms_values = rms_extractor.process(block.samples)
+                #extract mel values
+                mel_values = mel_extractor.process(block.samples)
 
-                # Send frame-end times and results to the separate plotting process.
+                # Send frame-end times and results to the plotting
                 if rms_plot is not None:
                     frame_times = [
                         (next_frame_start + args.frame_length + i * args.hop_length) / block.sample_rate
@@ -168,6 +189,8 @@ def main() -> int:
                 # Limit terminal updates to about twice per second.
                 if rms_values.size and block.end_seconds >= next_report_seconds:
                     terminal_print(f"RMS={rms_values[-1]:.5f}", flush=True)
+                    terminal_print(f"Mel peak={mel_extractor.band_frequencies[mel_values[-1].argmax()]:.0f} Hz",
+                                   flush=True)
                     next_report_seconds = block.end_seconds + 0.5
 
                 # Stop at a block boundary when the requested duration is reached.
