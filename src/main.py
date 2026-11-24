@@ -1,12 +1,4 @@
-#Stream audio and extract features
-#Defaults to the system's input device.
-"""
-Current features implemented:
-RMS
-Mel Spectrogram
-Chroma CQT
-20Nov2026
-"""
+"""Stream audio and extract RMS. Defaults to the system's input device."""
 
 import argparse
 from contextlib import ExitStack
@@ -16,6 +8,7 @@ import sys
 import sounddevice as sd
 from .audio_input import FileInput, MicrophoneInput
 from .feature.rms import RMSExtractor
+from .feature.spectral_centroid import SpectralCentroidExtractor
 from .feature.mel_spectrogram import MelExtractor
 from .feature.chroma_cqt import ChromaExtractor
 
@@ -131,6 +124,8 @@ def main() -> int:
 
             # Create the extractor once so it retains overlap between input blocks.
             rms_extractor = RMSExtractor(args.frame_length, args.hop_length)
+            # The centroid needs the sample rate, which is known from the first block.
+            centroid_extractor = None
 
             #create mel_extractor/chroma_extractor only as placeholders since they needs sample rate, after first block
             mel_extractor = None
@@ -145,10 +140,6 @@ def main() -> int:
             resources.callback(blocks.close)
 
             for block in blocks:
-                #create mel_extractor/chroma_extractor now since can get sample rate from the block
-                if mel_extractor is None:
-                    mel_extractor = MelExtractor(block.sample_rate, args.frame_length, args.hop_length)
-                    chroma_extractor = ChromaExtractor(block.sample_rate, args.hop_length)
                 # File playback only: write the same mono samples that RMS analyzes.
                 # Blocking output writes supply the clock, so FileInput does not sleep.
                 # Microphone input is never routed to the speakers.
@@ -163,6 +154,11 @@ def main() -> int:
                         if playback_underflows == 1:
                             print("Warning: playback underflow; audio output may have a gap.", file=sys.stderr)
 
+                # Create the centroid extractor once the source's sample rate is known.
+                if args.centroid and centroid_extractor is None:
+                    centroid_extractor = SpectralCentroidExtractor(
+                        block.sample_rate, args.frame_length, args.hop_length)
+
                 # Count received samples and reset analysis history if audio was lost.
                 received += len(block.samples)
                 discontinuities += int(block.discontinuity)
@@ -170,9 +166,15 @@ def main() -> int:
                     rms_extractor.reset()
                     mel_extractor.reset()
                     chroma_extractor.reset()
+
+                    centroid_extractor.reset()
                     next_frame_start = block.start_sample
                     if rms_plot is not None:
-                        rms_plot.update([block.time_seconds], [float("nan")], block.time_seconds)
+                        #rms_plot.update([block.time_seconds], [float("nan")], block.time_seconds)
+                        rms_plot.update(
+                            [block.time_seconds], [float("nan")], block.time_seconds,
+                            [float("nan")] if args.centroid else None,
+                        )
                     print("Warning: input discontinuity; RMS analysis history reset.", file=sys.stderr)
 
                 # Extract RMS for every new complete frame, keeping any overlap.
@@ -183,12 +185,19 @@ def main() -> int:
                 chroma_values = chroma_extractor.process(block.samples)
 
                 # Send frame-end times and results to the plotting
+                # Spectral centroid uses the same frame/hop, so it returns one value
+                # per RMS value and both arrays stay aligned.
+                centroid_values = (
+                    centroid_extractor.process(block.samples) if centroid_extractor is not None else None
+                )
+
+                # Send frame-end times and results to the separate plotting process.
                 if rms_plot is not None:
                     frame_times = [
                         (next_frame_start + args.frame_length + i * args.hop_length) / block.sample_rate
                         for i in range(len(rms_values))
                     ]
-                    rms_plot.update(frame_times, rms_values, block.end_seconds)
+                    rms_plot.update(frame_times, rms_values, block.end_seconds, centroid_values)
                     if not rms_plot.is_open:
                         break
                 next_frame_start += len(rms_values) * args.hop_length
@@ -202,9 +211,12 @@ def main() -> int:
                     if chroma_values.size:
                         terminal_print(f"Chroma peak={chroma_extractor.PITCH_CLASSES[chroma_values[-1].argmax()]}",
                                    flush=True)
+
+                    terminal_print(f"Centroid={centroid_values[-1]:.1f} Hz", flush=True)
                     next_report_seconds = block.end_seconds + 0.5
 
-                # Stop at a block boundary when the requested duration is reached.
+                # Stop at a block boundar
+                # y when the requested duration is reached.
                 if args.duration is not None and block.end_seconds >= args.duration:
                     break
 
@@ -230,4 +242,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
