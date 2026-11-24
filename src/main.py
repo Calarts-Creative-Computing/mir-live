@@ -9,6 +9,8 @@ import sounddevice as sd
 from .audio_input import FileInput, MicrophoneInput
 from .feature.rms import RMSExtractor
 from .feature.spectral_centroid import SpectralCentroidExtractor
+from .feature.mel_spectrogram import MelExtractor
+from .feature.chroma_cqt import ChromaExtractor
 
 _printing_enabled = True
 
@@ -54,9 +56,7 @@ def main() -> int:
     parser.add_argument("--output-device", type=device_id, help="File playback output device ID or name (default: system output)")
     parser.add_argument("--no-playback", action="store_true", help="Analyze a file silently instead of playing it")
     parser.add_argument("--plot", action=argparse.BooleanOptionalAction, default=False,
-                        help="Show a PyQtGraph window with RMS (and centroid with --centroid) (default: off; --no-plot disables it)")
-    parser.add_argument("--centroid", action=argparse.BooleanOptionalAction, default=False,
-                        help="Also compute spectral centroid in Hz (default: off; --no-centroid disables it)")
+                        help="Show a PyQtGraph RMS window (default: off; --no-plot disables it)")
 
     # Input settings control how audio arrives; frame and hop sizes control analysis.
     parser.add_argument("--sample-rate", type=positive_int, help="Microphone rate in Hz (default: device native rate)")
@@ -74,6 +74,9 @@ def main() -> int:
     # Check for incompatible settings before opening audio devices.
     if args.hop_length > args.frame_length:
         parser.error("--hop-length must not exceed --frame-length")
+    #check for frame length
+    if args.frame_length & (args.frame_length - 1):
+        parser.error("--frame-length must be power of 2 for melspec")
     if args.quiet:
         set_terminal_printing(False)
     if args.file and (args.device is not None or args.sample_rate is not None or args.channels != 1):
@@ -113,7 +116,7 @@ def main() -> int:
             if args.plot:
                 from .rms_plot import RMSPlot
 
-                rms_plot = RMSPlot(show_centroid=args.centroid)
+                rms_plot = RMSPlot()
                 resources.callback(rms_plot.close)
 
             label = str(source.path) if isinstance(source, FileInput) else "microphone"
@@ -123,6 +126,11 @@ def main() -> int:
             rms_extractor = RMSExtractor(args.frame_length, args.hop_length)
             # The centroid needs the sample rate, which is known from the first block.
             centroid_extractor = None
+
+            #create mel_extractor/chroma_extractor only as placeholders since they needs sample rate, after first block
+            mel_extractor = None
+            chroma_extractor = None
+
             next_frame_start = 0
             next_report_seconds = 0.0
             playback = None
@@ -156,8 +164,10 @@ def main() -> int:
                 discontinuities += int(block.discontinuity)
                 if block.discontinuity:
                     rms_extractor.reset()
-                    if centroid_extractor is not None:
-                        centroid_extractor.reset()
+                    mel_extractor.reset()
+                    chroma_extractor.reset()
+
+                    centroid_extractor.reset()
                     next_frame_start = block.start_sample
                     if rms_plot is not None:
                         #rms_plot.update([block.time_seconds], [float("nan")], block.time_seconds)
@@ -169,7 +179,12 @@ def main() -> int:
 
                 # Extract RMS for every new complete frame, keeping any overlap.
                 rms_values = rms_extractor.process(block.samples)
+                #extract mel values
+                mel_values = mel_extractor.process(block.samples)
+                #extract chroma values
+                chroma_values = chroma_extractor.process(block.samples)
 
+                # Send frame-end times and results to the plotting
                 # Spectral centroid uses the same frame/hop, so it returns one value
                 # per RMS value and both arrays stay aligned.
                 centroid_values = (
@@ -189,11 +204,15 @@ def main() -> int:
 
                 # Limit terminal updates to about twice per second.
                 if rms_values.size and block.end_seconds >= next_report_seconds:
-                    # terminal_print(f"RMS={rms_values[-1]:.5f}", flush=True)
-                    line = f"RMS={rms_values[-1]:.5f}"
-                    if centroid_values is not None:
-                        line += f"  Centroid={centroid_values[-1]:.1f} Hz"
-                    terminal_print(line, flush=True)
+                    terminal_print(f"RMS={rms_values[-1]:.5f}", flush=True)
+                    terminal_print(f"Mel peak={mel_extractor.band_frequencies[mel_values[-1].argmax()]:.0f} Hz",
+                                   flush=True)
+                    #chroma_values needs enough frames to have a valid frame since it uses larger frames sizes than the other extrators
+                    if chroma_values.size:
+                        terminal_print(f"Chroma peak={chroma_extractor.PITCH_CLASSES[chroma_values[-1].argmax()]}",
+                                   flush=True)
+
+                    terminal_print(f"Centroid={centroid_values[-1]:.1f} Hz", flush=True)
                     next_report_seconds = block.end_seconds + 0.5
 
                 # Stop at a block boundar
