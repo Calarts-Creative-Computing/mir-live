@@ -8,6 +8,7 @@ import sys
 import sounddevice as sd
 from .audio_input import FileInput, MicrophoneInput
 from .feature.rms import RMSExtractor
+from .feature.spectral_centroid import SpectralCentroidExtractor
 
 _printing_enabled = True
 
@@ -53,7 +54,9 @@ def main() -> int:
     parser.add_argument("--output-device", type=device_id, help="File playback output device ID or name (default: system output)")
     parser.add_argument("--no-playback", action="store_true", help="Analyze a file silently instead of playing it")
     parser.add_argument("--plot", action=argparse.BooleanOptionalAction, default=False,
-                        help="Show a PyQtGraph RMS window (default: off; --no-plot disables it)")
+                        help="Show a PyQtGraph window with RMS (and centroid with --centroid) (default: off; --no-plot disables it)")
+    parser.add_argument("--centroid", action=argparse.BooleanOptionalAction, default=False,
+                        help="Also compute spectral centroid in Hz (default: off; --no-centroid disables it)")
 
     # Input settings control how audio arrives; frame and hop sizes control analysis.
     parser.add_argument("--sample-rate", type=positive_int, help="Microphone rate in Hz (default: device native rate)")
@@ -110,7 +113,7 @@ def main() -> int:
             if args.plot:
                 from .rms_plot import RMSPlot
 
-                rms_plot = RMSPlot()
+                rms_plot = RMSPlot(show_centroid=args.centroid)
                 resources.callback(rms_plot.close)
 
             label = str(source.path) if isinstance(source, FileInput) else "microphone"
@@ -118,6 +121,8 @@ def main() -> int:
 
             # Create the extractor once so it retains overlap between input blocks.
             rms_extractor = RMSExtractor(args.frame_length, args.hop_length)
+            # The centroid needs the sample rate, which is known from the first block.
+            centroid_extractor = None
             next_frame_start = 0
             next_report_seconds = 0.0
             playback = None
@@ -141,18 +146,35 @@ def main() -> int:
                         if playback_underflows == 1:
                             print("Warning: playback underflow; audio output may have a gap.", file=sys.stderr)
 
+                # Create the centroid extractor once the source's sample rate is known.
+                if args.centroid and centroid_extractor is None:
+                    centroid_extractor = SpectralCentroidExtractor(
+                        block.sample_rate, args.frame_length, args.hop_length)
+
                 # Count received samples and reset analysis history if audio was lost.
                 received += len(block.samples)
                 discontinuities += int(block.discontinuity)
                 if block.discontinuity:
                     rms_extractor.reset()
+                    if centroid_extractor is not None:
+                        centroid_extractor.reset()
                     next_frame_start = block.start_sample
                     if rms_plot is not None:
-                        rms_plot.update([block.time_seconds], [float("nan")], block.time_seconds)
+                        #rms_plot.update([block.time_seconds], [float("nan")], block.time_seconds)
+                        rms_plot.update(
+                            [block.time_seconds], [float("nan")], block.time_seconds,
+                            [float("nan")] if args.centroid else None,
+                        )
                     print("Warning: input discontinuity; RMS analysis history reset.", file=sys.stderr)
 
                 # Extract RMS for every new complete frame, keeping any overlap.
                 rms_values = rms_extractor.process(block.samples)
+
+                # Spectral centroid uses the same frame/hop, so it returns one value
+                # per RMS value and both arrays stay aligned.
+                centroid_values = (
+                    centroid_extractor.process(block.samples) if centroid_extractor is not None else None
+                )
 
                 # Send frame-end times and results to the separate plotting process.
                 if rms_plot is not None:
@@ -160,17 +182,22 @@ def main() -> int:
                         (next_frame_start + args.frame_length + i * args.hop_length) / block.sample_rate
                         for i in range(len(rms_values))
                     ]
-                    rms_plot.update(frame_times, rms_values, block.end_seconds)
+                    rms_plot.update(frame_times, rms_values, block.end_seconds, centroid_values)
                     if not rms_plot.is_open:
                         break
                 next_frame_start += len(rms_values) * args.hop_length
 
                 # Limit terminal updates to about twice per second.
                 if rms_values.size and block.end_seconds >= next_report_seconds:
-                    terminal_print(f"RMS={rms_values[-1]:.5f}", flush=True)
+                    # terminal_print(f"RMS={rms_values[-1]:.5f}", flush=True)
+                    line = f"RMS={rms_values[-1]:.5f}"
+                    if centroid_values is not None:
+                        line += f"  Centroid={centroid_values[-1]:.1f} Hz"
+                    terminal_print(line, flush=True)
                     next_report_seconds = block.end_seconds + 0.5
 
-                # Stop at a block boundary when the requested duration is reached.
+                # Stop at a block boundar
+                # y when the requested duration is reached.
                 if args.duration is not None and block.end_seconds >= args.duration:
                     break
 
